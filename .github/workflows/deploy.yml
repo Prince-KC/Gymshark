@@ -1,0 +1,179 @@
+name: Deploy Gymshark (CloudFormation + SSH)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:   # Enables the manual "Run workflow" button in GitHub Actions UI
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: gymshark-stack
+
+jobs:
+  # -------------------------------------------------------------
+  # JOB 1: BUILD FRONTEND (Runs on GitHub's fast 7GB runner)
+  # -------------------------------------------------------------
+  build:
+    name: Build Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install & Compile React
+        env:
+          VITE_API_URL: /api
+        run: |
+          cd frontend
+          npm install
+          npm run build
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+
+  # -------------------------------------------------------------
+  # JOB 2: DEPLOY TO AWS EC2
+  # -------------------------------------------------------------
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Frontend Build
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy CloudFormation Stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name ${{ env.STACK_NAME }} \
+            --template-file infra/ec2-instance.yaml \
+            --parameter-overrides InstanceType=t2.micro \
+            --no-fail-on-empty-changeset \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Get EC2 Public IP
+        id: get-ip
+        run: |
+          IP=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query "Stacks[0].Outputs[?OutputKey=='PublicIP'].OutputValue" \
+            --output text)
+          echo "EC2_IP=$IP" >> $GITHUB_OUTPUT
+          echo "Server IP: $IP"
+
+      - name: Get SSH Key from SSM Parameter Store
+        id: get-key
+        run: |
+          SSM_PATH=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query "Stacks[0].Outputs[?OutputKey=='SSMKeyPath'].OutputValue" \
+            --output text)
+          aws ssm get-parameter \
+            --name "$SSM_PATH" \
+            --with-decryption \
+            --region ${{ env.AWS_REGION }} \
+            --query "Parameter.Value" \
+            --output text > /tmp/gymshark-key.pem
+          chmod 600 /tmp/gymshark-key.pem
+
+      - name: Wait for SSH Availability
+        run: |
+          IP=${{ steps.get-ip.outputs.EC2_IP }}
+          for i in $(seq 1 36); do
+            if nc -zw5 "$IP" 22 2>/dev/null; then
+              echo "SSH port 22 is open!"
+              exit 0
+            fi
+            echo "Waiting for SSH on $IP... ($i/36)"
+            sleep 10
+          done
+          exit 1
+
+      - name: Deploy Application via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          EC2_IP: ${{ steps.get-ip.outputs.EC2_IP }}
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        with:
+          host: ${{ steps.get-ip.outputs.EC2_IP }}
+          username: ubuntu
+          key_path: /tmp/gymshark-key.pem
+          script_stop: true
+          envs: EC2_IP,MONGO_URI,JWT_SECRET
+          script: |
+            echo ">>> [1/5] Waiting for cloud-init bootstrap..."
+            sudo cloud-init status --wait || true
+
+            echo ">>> [2/5] Ensuring code repository exists..."
+            if [ ! -d /var/www/app/.git ]; then
+              sudo mkdir -p /var/www/app
+              sudo chown -R ubuntu:ubuntu /var/www/app
+              git clone https://github.com/Prince-KC/Gymshark.git /var/www/app
+            fi
+            cd /var/www/app
+            git fetch origin main
+            git reset --hard origin/main
+
+            echo ">>> [3/5] Installing backend dependencies..."
+            cd /var/www/app/backend
+            npm install --omit=dev
+
+            echo ">>> [4/5] Injecting production .env file..."
+            printf "PORT=5000\nNODE_ENV=production\nCLIENT_URL=http://%s\nMONGO_URI=%s\nJWT_SECRET=%s\n" \
+              "$EC2_IP" "$MONGO_URI" "$JWT_SECRET" > /var/www/app/backend/.env
+
+            echo ">>> [5/5] Building frontend and reloading PM2/Nginx..."
+            cd /var/www/app/frontend
+            npm install
+            npm run build
+
+            cd /var/www/app/backend
+            # Seed products if running for the first time
+            node src/seed.js || true
+
+            sudo mkdir -p /var/log/pm2
+            sudo chown -R ubuntu:ubuntu /var/log/pm2
+
+            pm2 delete all 2>/dev/null || true
+            pm2 start ecosystem.config.cjs --update-env
+            pm2 save
+            pm2 startup systemd -u ubuntu --hp /home/ubuntu 2>/dev/null || true
+
+            sudo cp -f /var/www/app/infra/nginx.conf /etc/nginx/sites-available/gymshark
+            sudo ln -sf /etc/nginx/sites-available/gymshark /etc/nginx/sites-enabled/gymshark
+            sudo rm -f /etc/nginx/sites-enabled/default
+            sudo nginx -t && sudo systemctl reload nginx
+
+      - name: Print Live URL
+        run: echo "🎉 Live Gymshark site at http://${{ steps.get-ip.outputs.EC2_IP }}"
+
+      - name: Cleanup Temporary Key
+        if: always()
+        run: rm -f /tmp/gymshark-key.pem
