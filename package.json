@@ -1,0 +1,26 @@
+{
+  "name": "gymshark-mern-app",
+  "version": "1.0.0",
+  "description": "Full MERN Stack Gymshark E-Commerce Website (React + Vite + Express + MongoDB)",
+  "main": "start.js",
+  "type": "module",
+  "scripts": {
+    "start": "node start.js",
+    "dev": "node start.js",
+    "run": "node start.js",
+    "build": "npm --prefix frontend run build",
+    "seed": "node backend/src/seed.js",
+    "backend": "node backend/index.js",
+    "frontend": "npm --prefix frontend run dev"
+  },
+  "keywords": [
+    "gymshark",
+    "mern",
+    "react",
+    "express",
+    "mongodb",
+    "ecommerce"
+  ],
+  "author": "Prince-KC",
+  "license": "ISC"
+}
